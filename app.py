@@ -60,7 +60,7 @@ def lookup_prima_endpoint():
 
     plate = _normalize_plate(plate)
     print(f"[Prima Service] Lookup {plate}")
-    ensure_warm()
+    ensure_warm("prima")
 
     result = lookup_prima(plate, birth_date or "")
     if result:
@@ -97,7 +97,7 @@ def lookup_allianz_endpoint():
 
     t0 = time.time()
     print(f"[Allianz] Lookup {plate}")
-    ensure_warm()
+    ensure_warm("allianz")
     result = allianz_search(plate, birth_date or "")
     elapsed = int((time.time() - t0) * 1000)
     if result:
@@ -106,27 +106,26 @@ def lookup_allianz_endpoint():
     return jsonify({"success": True, "found": False, "data": None, "plate": plate, "source": "allianz", "elapsed_ms": elapsed}), 404
 
 
-# Lazy sync warmup on first request — Playwright sync API is thread-bound.
-_WARMED = False
+# Chaque scraper a son thread Playwright dedie (voir *_scraper.py).
+# Warmup paresseux et cible : on ne paie pas Prima quand on appelle Allianz.
+_WARMED = {"prima": False, "allianz": False}
 
 
-def ensure_warm() -> None:
-    global _WARMED
-    if _WARMED:
+def ensure_warm(which: str) -> None:
+    if _WARMED.get(which):
         return
+    label = "Prima" if which == "prima" else "Allianz"
     try:
-        print("[Service] Warming Prima...")
-        prima_warmup()
-        print("[Service] Prima warm OK")
+        print(f"[Service] Warming {label}...")
+        (prima_warmup if which == "prima" else allianz_warmup)()
+        _WARMED[which] = True
+        print(f"[Service] {label} warm OK")
     except Exception as e:
-        print(f"[Service] Prima warm failed: {e}")
-    try:
-        print("[Service] Warming Allianz...")
-        allianz_warmup()
-        print("[Service] Allianz warm OK")
-    except Exception as e:
-        print(f"[Service] Allianz warm failed: {e}")
-    _WARMED = True
+        print(f"[Service] {label} warm failed: {e}")
+
+
+def _ensure_warm(which: str = "prima") -> None:
+    ensure_warm(which)
 
 
 if __name__ == "__main__":

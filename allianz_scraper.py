@@ -10,6 +10,7 @@ Optimisé pour <15s par lookup (session chaude) :
 from __future__ import annotations
 
 import os
+import queue
 import re
 import threading
 import time
@@ -298,12 +299,27 @@ class AllianzBrowserSession:
         except Exception:
             pass
 
+    def _drop_thread_greenlets(self) -> None:
+        """Detache les references Playwright dont les greenlets appartiennent
+        a un thread deja termine (les appeler depuis un autre thread leve
+        greenlet.error)."""
+        self._quote_page = None
+        self._context = None
+        self._browser = None
+        self._playwright = None
+
     def _bootstrap(self) -> None:
+        tid = threading.get_ident()
+        if self._owner_thread_id is not None and self._owner_thread_id != tid:
+            print("[Allianz IT] Rebind session to current thread")
+            self._drop_thread_greenlets()
+
         print("[Allianz IT] Bootstrap session Playwright…")
         if not self._playwright:
             self._playwright = sync_playwright().start()
-
-        self._close()
+        else:
+            self._close()
+        self._owner_thread_id = tid
 
         self._browser = self._playwright.chromium.launch(
             headless=os.environ.get("ALLIANZ_HEADLESS", "false").lower() == "true",
@@ -381,23 +397,10 @@ class AllianzBrowserSession:
         return page
 
     def _ensure_session(self, force_refresh: bool = False) -> None:
-        tid = threading.get_ident()
-        wrong_thread = (
-            self._owner_thread_id is not None and self._owner_thread_id != tid
-        )
-        if force_refresh or wrong_thread or self._session_expired():
-            if wrong_thread:
-                print("[Allianz IT] Rebind session to request thread")
-                self._quote_page = None
-                self._context = None
-                self._browser = None
-                self._playwright = None
+        if force_refresh or self._session_expired():
             self._bootstrap()
-            self._owner_thread_id = tid
         elif not self._quote_page or self._quote_page.is_closed():
             self._bootstrap()
-            self._owner_thread_id = tid
-
     def _api_headers(self) -> dict[str, str]:
         headers = {
             "Accept": "application/json, text/plain, */*",
@@ -633,16 +636,63 @@ class AllianzBrowserSession:
             return None
 
 
+class _PlaywrightThread:
+    """Thread dedie par session Playwright.
+
+    Playwright sync ne tolere qu'un seul client par thread/boucle evenementielle:
+    si deux scrapers (Prima + Allianz) demarrent dans le meme worker gunicorn,
+    le second leve "Sync API inside the asyncio loop". Chaque session vit donc
+    dans son propre thread, qui execute aussi les lookups.
+    """
+
+    def __init__(self, factory, name: str) -> None:
+        self._name = name
+        self._jobs: "queue.Queue" = queue.Queue()
+        self._thread = threading.Thread(
+            target=self._run, args=(factory,), daemon=True, name=name
+        )
+        self._thread.start()
+
+    def _run(self, factory) -> None:
+        try:
+            session = factory()
+        except Exception as exc:  # pragma: no cover
+            print(f"[{self._name}] session init failed: {exc}")
+            session = None
+        while True:
+            job = self._jobs.get()
+            if job is None:
+                return
+            fn, args, kwargs, box = job
+            try:
+                box["result"] = fn(session, *args, **kwargs)
+            except Exception as exc:
+                box["error"] = exc
+            finally:
+                box["done"].set()
+
+    def call(self, fn, *args, timeout: float = 120, **kwargs):
+        box = {"done": threading.Event(), "result": None, "error": None}
+        self._jobs.put((fn, args, kwargs, box))
+        if not box["done"].wait(timeout):
+            raise TimeoutError(f"[{self._name}] job timeout ({timeout:.0f}s)")
+        if box["error"] is not None:
+            raise box["error"]
+        return box["result"]
+
+
+_session = _PlaywrightThread(AllianzBrowserSession, 'Allianz IT')
+
+
 def warmup_session() -> None:
     try:
-        _session._ensure_session(force_refresh=True)
+        _session.call(lambda s: s._ensure_session(force_refresh=True), timeout=90)
     except Exception as exc:
         print(f"[Allianz IT] Warmup error: {exc}")
 
 
-_session = AllianzBrowserSession()
-
-
 def search_by_plate(plate: str, birth_date: str = "") -> Optional[dict]:
-    """Lookup plafonné à LOOKUP_DEADLINE_SECONDS (défaut 18s)."""
-    return _session.lookup(plate, birth_date)
+    return _session.call(
+        lambda s: s.lookup(plate, birth_date),
+        timeout=LOOKUP_DEADLINE_SECONDS + 40,
+    )

@@ -2,7 +2,7 @@ FROM mcr.microsoft.com/playwright/python:v1.49.1-jammy
 
 WORKDIR /app
 
-ARG CACHEBUST=202610281935-syncwarm
+ARG CACHEBUST=pwthread-202610282017
 RUN echo cachebust=$CACHEBUST
 
 RUN apt-get update && apt-get install -y --no-install-recommends xvfb \
