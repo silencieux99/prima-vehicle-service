@@ -60,6 +60,7 @@ def lookup_prima_endpoint():
 
     plate = _normalize_plate(plate)
     print(f"[Prima Service] Lookup {plate}")
+    ensure_warm()
 
     result = lookup_prima(plate, birth_date or "")
     if result:
@@ -96,6 +97,7 @@ def lookup_allianz_endpoint():
 
     t0 = time.time()
     print(f"[Allianz] Lookup {plate}")
+    ensure_warm()
     result = allianz_search(plate, birth_date or "")
     elapsed = int((time.time() - t0) * 1000)
     if result:
@@ -104,9 +106,14 @@ def lookup_allianz_endpoint():
     return jsonify({"success": True, "found": False, "data": None, "plate": plate, "source": "allianz", "elapsed_ms": elapsed}), 404
 
 
-# Warmup non-bloquant
-import threading
-def _bg_warm():
+# Lazy sync warmup on first request — Playwright sync API is thread-bound.
+_WARMED = False
+
+
+def ensure_warm() -> None:
+    global _WARMED
+    if _WARMED:
+        return
     try:
         print("[Service] Warming Prima...")
         prima_warmup()
@@ -119,7 +126,7 @@ def _bg_warm():
         print("[Service] Allianz warm OK")
     except Exception as e:
         print(f"[Service] Allianz warm failed: {e}")
-threading.Thread(target=_bg_warm, daemon=True).start()
+    _WARMED = True
 
 
 if __name__ == "__main__":

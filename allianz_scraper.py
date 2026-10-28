@@ -159,6 +159,7 @@ class AllianzBrowserSession:
         self._token_refreshed_at = 0.0
         self._cookies_accepted = False
         self._api_fail_streak = 0
+        self._owner_thread_id: Optional[int] = None
 
     def _session_expired(self) -> bool:
         if not self._context:
@@ -380,10 +381,22 @@ class AllianzBrowserSession:
         return page
 
     def _ensure_session(self, force_refresh: bool = False) -> None:
-        if force_refresh or self._session_expired():
+        tid = threading.get_ident()
+        wrong_thread = (
+            self._owner_thread_id is not None and self._owner_thread_id != tid
+        )
+        if force_refresh or wrong_thread or self._session_expired():
+            if wrong_thread:
+                print("[Allianz IT] Rebind session to request thread")
+                self._quote_page = None
+                self._context = None
+                self._browser = None
+                self._playwright = None
             self._bootstrap()
+            self._owner_thread_id = tid
         elif not self._quote_page or self._quote_page.is_closed():
             self._bootstrap()
+            self._owner_thread_id = tid
 
     def _api_headers(self) -> dict[str, str]:
         headers = {
