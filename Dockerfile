@@ -2,6 +2,9 @@ FROM mcr.microsoft.com/playwright/python:v1.49.1-jammy
 
 WORKDIR /app
 
+ARG CACHEBUST=20261028c
+RUN echo cachebust=$CACHEBUST
+
 RUN apt-get update && apt-get install -y --no-install-recommends xvfb \
     && rm -rf /var/lib/apt/lists/*
 

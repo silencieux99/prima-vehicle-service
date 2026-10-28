@@ -7,6 +7,7 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 
 from prima_scraper import search_by_plate as prima_search, warmup_session as prima_warmup
+from allianz_scraper import search_by_plate as allianz_search, warmup_session as allianz_warmup
 
 app = Flask(__name__)
 CORS(app, origins=[
@@ -41,7 +42,7 @@ def lookup_prima(plate: str, birth_date: str):
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "prima-vehicle-api", "source": "prima-playwright"}), 200
+    return jsonify({"status": "ok", "service": "prima-vehicle-api", "sources": ["prima-playwright", "allianz-playwright"], "version": "allianz-fast-2026-10-28"}), 200
 
 
 @app.route("/api/prima", methods=["GET", "POST"])
@@ -66,13 +67,59 @@ def lookup_prima_endpoint():
     return jsonify({"error": "no results found", "plate": plate}), 404
 
 
-# Warmup au démarrage
-try:
-    print("[Prima Service] Warming up Playwright session...")
-    prima_warmup()
-    print("[Prima Service] Warmup complete")
-except Exception as e:
-    print(f"[Prima Service] Warmup failed (will retry on first request): {e}")
+
+
+# Cache Allianz
+_ALLIANZ_CACHE: dict[str, tuple[float, dict]] = {}
+ALLIANZ_CACHE_TTL = int(os.environ.get("LOOKUP_CACHE_TTL_SECONDS", "3600"))
+
+
+@app.route("/api/allianz", methods=["GET", "POST"])
+def lookup_allianz_endpoint():
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        plate = data.get("plate") or data.get("targa")
+        birth_date = data.get("birth_date") or data.get("birthDate") or data.get("data_nascita")
+    else:
+        plate = request.args.get("plate") or request.args.get("targa")
+        birth_date = request.args.get("birth_date") or request.args.get("birthDate") or request.args.get("data_nascita")
+
+    if not plate:
+        return jsonify({"error": "plate parameter required"}), 400
+
+    plate = _normalize_plate(plate)
+    now = time.time()
+    hit = _ALLIANZ_CACHE.get(plate)
+    if hit and hit[0] > now:
+        print(f"[Allianz] cache hit {plate}")
+        return jsonify({"success": True, "found": True, "data": hit[1], "source": "allianz", "elapsed_ms": 0}), 200
+
+    t0 = time.time()
+    print(f"[Allianz] Lookup {plate}")
+    result = allianz_search(plate, birth_date or "")
+    elapsed = int((time.time() - t0) * 1000)
+    if result:
+        _ALLIANZ_CACHE[plate] = (now + ALLIANZ_CACHE_TTL, result)
+        return jsonify({"success": True, "found": True, "data": result, "source": "allianz", "elapsed_ms": elapsed}), 200
+    return jsonify({"success": True, "found": False, "data": None, "plate": plate, "source": "allianz", "elapsed_ms": elapsed}), 404
+
+
+# Warmup non-bloquant
+import threading
+def _bg_warm():
+    try:
+        print("[Service] Warming Prima...")
+        prima_warmup()
+        print("[Service] Prima warm OK")
+    except Exception as e:
+        print(f"[Service] Prima warm failed: {e}")
+    try:
+        print("[Service] Warming Allianz...")
+        allianz_warmup()
+        print("[Service] Allianz warm OK")
+    except Exception as e:
+        print(f"[Service] Allianz warm failed: {e}")
+threading.Thread(target=_bg_warm, daemon=True).start()
 
 
 if __name__ == "__main__":
