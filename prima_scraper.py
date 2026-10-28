@@ -28,7 +28,7 @@ USER_AGENT = (
 SESSION_TTL_SECONDS = int(os.environ.get("PRIMA_SESSION_TTL_SECONDS", "1800"))
 UI_TIMEOUT_MS = int(os.environ.get("PRIMA_UI_TIMEOUT_MS", "15000"))
 # Budget total par lookup (cible client ≤25s)
-LOOKUP_DEADLINE_SECONDS = float(os.environ.get("PRIMA_LOOKUP_DEADLINE_SECONDS", "22"))
+LOOKUP_DEADLINE_SECONDS = float(os.environ.get("PRIMA_LOOKUP_DEADLINE_SECONDS", "40"))
 
 
 def _normalize_plate(plate: str) -> str:
@@ -73,23 +73,39 @@ class PrimaBrowserSession:
             self._browser = None
         self._cookies_accepted = False
 
+    def _dismiss_cookiebot_overlay(self, page: Page) -> None:
+        try:
+            page.evaluate(
+                """() => {
+                  const d = document.getElementById('CybotCookiebotDialog');
+                  if (d) d.remove();
+                  document.querySelectorAll('[id*=Cookiebot]').forEach(e => e.remove());
+                }"""
+            )
+        except Exception:
+            pass
+
     def _accept_cookies(self, page: Page) -> None:
-        if self._cookies_accepted:
-            return
-        for selector in (
-            "button:has-text('Accetta tutti')",
-            "button:has-text('Accetta')",
-            "[data-testid='accept-all']",
-        ):
-            try:
-                btn = page.locator(selector).first
-                if btn.is_visible(timeout=800):
-                    btn.click(timeout=2000)
-                    page.wait_for_timeout(400)
-                    self._cookies_accepted = True
-                    return
-            except Exception:
-                pass
+        if not self._cookies_accepted:
+            for selector in (
+                "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll",
+                "#CybotCookiebotDialogBodyButtonAccept",
+                "button:has-text('Accetta tutti')",
+                "button:has-text('Consenti tutti')",
+                "button:has-text('Accetta')",
+                "[data-testid='accept-all']",
+            ):
+                try:
+                    btn = page.locator(selector).first
+                    if btn.is_visible(timeout=1200):
+                        btn.click(force=True, timeout=2000)
+                        page.wait_for_timeout(500)
+                        self._cookies_accepted = True
+                        break
+                except Exception:
+                    pass
+        # Cookiebot peut rester / réapparaître devant les modals
+        self._dismiss_cookiebot_overlay(page)
 
     def _bootstrap(self) -> None:
         print("[Prima IT] Bootstrap session Playwright…")
@@ -124,13 +140,27 @@ class PrimaBrowserSession:
             self._bootstrap()
 
     def _get_select_value(self, page: Page, label: str) -> Optional[str]:
-        """Extrait la valeur d'un combobox/input par son label."""
+        """Extrait le texte visible de l'option sélectionnée (pas le code interne)."""
         try:
             locator = page.get_by_label(label)
-            if locator.count() > 0:
-                value = locator.input_value(timeout=2000)
-                if value and value.strip() and "Seleziona" not in value:
-                    return value.strip()
+            if locator.count() == 0:
+                return None
+            handle = locator.element_handle(timeout=2000)
+            if not handle:
+                return None
+            # Prefer selected <option> label over raw value codes (000122, etc.)
+            text = page.evaluate(
+                """(el) => {
+                  if (el.tagName === 'SELECT' && el.selectedIndex >= 0) {
+                    const opt = el.options[el.selectedIndex];
+                    return (opt && opt.text || '').trim();
+                  }
+                  return (el.value || '').trim();
+                }""",
+                handle,
+            )
+            if text and "Seleziona" not in text:
+                return text
         except Exception:
             pass
         return None
@@ -262,13 +292,16 @@ class PrimaBrowserSession:
                 # Étape 1: Page targa
                 print(f"[Prima IT] Loading targa page for {clean_plate}")
                 page.goto(ENTRY_URL, wait_until="domcontentloaded", timeout=20000)
+                page.wait_for_timeout(1500)
                 self._accept_cookies(page)
-                page.wait_for_timeout(500)
+                page.wait_for_timeout(400)
 
-                # Étape 2: Remplir le formulaire
+                # Étape 2: Remplir le formulaire (press_sequentially pour déclencher React)
                 plate_input = page.get_by_placeholder("Inserisci numero di targa")
+                plate_input.wait_for(state="visible", timeout=8000)
                 plate_input.click(timeout=5000)
-                plate_input.fill(clean_plate, timeout=4000)
+                plate_input.fill("")
+                plate_input.press_sequentially(clean_plate, delay=30)
 
                 # Date de naissance
                 dob = (birth_date or "01/01/1990").strip()
@@ -278,32 +311,48 @@ class PrimaBrowserSession:
                 else:
                     day, month, year = "01", "01", "1990"
 
-                page.get_by_placeholder("GG").fill(day, timeout=2000)
-                page.get_by_placeholder("MM").fill(month, timeout=2000)
-                page.get_by_placeholder("AAAA").fill(year, timeout=2000)
+                for ph, val in (("GG", day), ("MM", month), ("AAAA", year)):
+                    field = page.get_by_placeholder(ph)
+                    field.click(timeout=2000)
+                    field.fill("")
+                    field.press_sequentially(val, delay=20)
 
-                page.wait_for_timeout(800)
+                page.keyboard.press("Tab")
+                page.wait_for_timeout(1000)
 
                 # Étape 3: Click "Procedi"
                 procedi_btn = page.get_by_role("button", name="Procedi")
                 if procedi_btn.is_disabled(timeout=1000):
-                    # Attendre que le site reconnaisse la plaque
                     page.wait_for_timeout(3000)
 
                 procedi_btn.click(timeout=5000)
-                page.wait_for_timeout(1500)
+                page.wait_for_timeout(2000)
 
-                # Étape 4: Dialog de confirmation → "Continua come privato"
-                continua_privato = page.get_by_role("button", name="Continua come privato")
-                if continua_privato.is_visible(timeout=2000):
-                    continua_privato.click(timeout=3000)
-                    page.wait_for_timeout(1500)
-                    # Re-cliquer Procedi après le dialog
-                    try:
-                        page.get_by_role("button", name="Procedi").click(timeout=5000)
-                        page.wait_for_timeout(2000)
-                    except Exception:
-                        pass
+                # Étape 4: Dialog confirmation (société OU privé)
+                # Cookiebot peut réapparaître et bloquer le clic
+                self._accept_cookies(page)
+                try:
+                    continua_privato = page.get_by_role("button", name="Continua come privato")
+                    continua = page.get_by_role("button", name="Continua", exact=True)
+                    if continua_privato.is_visible(timeout=2500):
+                        print(f"[Prima IT] Modal société → privato pour {clean_plate}")
+                        continua_privato.click(force=True, timeout=5000)
+                        page.wait_for_timeout(1000)
+                        page.get_by_role("button", name="Procedi").click(force=True, timeout=5000)
+                    elif continua.is_visible(timeout=2000):
+                        print(f"[Prima IT] Modal confirmation → Continua pour {clean_plate}")
+                        continua.click(force=True, timeout=5000)
+                    else:
+                        print(f"[Prima IT] Pas de modal confirmation pour {clean_plate}")
+                except Exception as exc:
+                    print(f"[Prima IT] Modal skip: {exc}")
+
+                # Attendre la page form (achat véhicule)
+                try:
+                    page.wait_for_url("**/form/**", timeout=12000)
+                except Exception:
+                    print(f"[Prima IT] Pas de navigation form pour {clean_plate} url={page.url}")
+                    return None
 
                 # Capturer l'application_id de l'URL
                 current_url = page.url
@@ -312,17 +361,38 @@ class PrimaBrowserSession:
                     application_id = match.group(1)
                     captured_data["application_id"] = application_id
 
-                # Étape 5: Page "Acquisto veicolo" → extraire date immatricolazione
-                reg_data = self._extract_registration_date(page)
+                # Étape 5: Page "Acquisto veicolo" → attendre chargement puis extraire
+                try:
+                    page.wait_for_selector("text=Acquisto veicolo", timeout=8000)
+                except Exception:
+                    pass
+                # Prima charge parfois les dates en async ("Stiamo caricando…")
+                for _ in range(8):
+                    reg_data = self._extract_registration_date(page)
+                    if reg_data.get("mese_immatricolazione") and reg_data.get("anno_immatricolazione"):
+                        break
+                    page.wait_for_timeout(700)
                 captured_data.update(reg_data)
 
                 if "mese_immatricolazione" not in captured_data:
-                    print(f"[Prima IT] No registration date found for {clean_plate}")
+                    # Fallback via IDs directs
+                    try:
+                        mese_val = page.locator("#month-pageVehiclePurchaseInformationOverrideFormRegistrationDateField").input_value(timeout=1000)
+                        anno_val = page.locator("#year-pageVehiclePurchaseInformationOverrideFormRegistrationDateField").input_value(timeout=1000)
+                        if mese_val:
+                            captured_data["mese_immatricolazione"] = int(mese_val)
+                        if anno_val:
+                            captured_data["anno_immatricolazione"] = int(anno_val)
+                    except Exception:
+                        pass
+
+                if "mese_immatricolazione" not in captured_data:
+                    print(f"[Prima IT] No registration date found for {clean_plate} url={page.url}")
                     return None
 
                 # Étape 6: Click "Procedi" → page "Informazioni veicolo"
                 page.get_by_role("button", name="Procedi").click(timeout=5000)
-                page.wait_for_timeout(2000)
+                page.wait_for_timeout(2500)
 
                 # Étape 7: Extraire les données véhicule
                 vehicle_data = self._extract_vehicle_data(page)
