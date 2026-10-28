@@ -42,7 +42,7 @@ def lookup_prima(plate: str, birth_date: str):
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "prima-vehicle-api", "sources": ["prima-playwright", "allianz-playwright"], "version": "allianz-fast-2026-10-28"}), 200
+    return jsonify({"status": "ok", "service": "prima-vehicle-api", "sources": ["prima-playwright", "allianz-playwright"], "version": "allianz-fast-20261028192256"}), 200
 
 
 @app.route("/api/prima", methods=["GET", "POST"])
