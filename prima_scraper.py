@@ -27,9 +27,10 @@ USER_AGENT = (
 )
 
 SESSION_TTL_SECONDS = int(os.environ.get("PRIMA_SESSION_TTL_SECONDS", "1800"))
-UI_TIMEOUT_MS = int(os.environ.get("PRIMA_UI_TIMEOUT_MS", "15000"))
-# Budget total par lookup (cible client ≤25s)
-LOOKUP_DEADLINE_SECONDS = float(os.environ.get("PRIMA_LOOKUP_DEADLINE_SECONDS", "40"))
+UI_TIMEOUT_MS = int(os.environ.get("PRIMA_UI_TIMEOUT_MS", "12000"))
+# Budget total par lookup — court pour ne pas saturer gunicorn
+LOOKUP_DEADLINE_SECONDS = float(os.environ.get("PRIMA_LOOKUP_DEADLINE_SECONDS", "22"))
+JOB_TIMEOUT_SECONDS = float(os.environ.get("PRIMA_JOB_TIMEOUT_SECONDS", "28"))
 
 
 def _normalize_plate(plate: str) -> str:
@@ -487,42 +488,75 @@ class PrimaBrowserSession:
 class _PlaywrightThread:
     """Thread dedie par session Playwright.
 
-    Playwright sync ne tolere qu'un seul client par thread/boucle evenementielle:
-    si deux scrapers (Prima + Allianz) demarrent dans le meme worker gunicorn,
-    le second leve "Sync API inside the asyncio loop". Chaque session vit donc
-    dans son propre thread, qui execute aussi les lookups.
+    Playwright sync ne tolere qu'un seul client par thread/boucle evenementielle.
+    Sur timeout: on abandonne le job et on REDEMARRE le thread — sinon la file
+    reste bloquee derriere un Chromium fige et /health meurt.
     """
 
     def __init__(self, factory, name: str) -> None:
+        self._factory = factory
         self._name = name
+        self._gen = 0
         self._jobs: "queue.Queue" = queue.Queue()
-        self._thread = threading.Thread(
-            target=self._run, args=(factory,), daemon=True, name=name
-        )
-        self._thread.start()
+        self._ctrl = threading.Lock()
+        self._start_worker()
 
-    def _run(self, factory) -> None:
+    def _start_worker(self) -> None:
+        self._gen += 1
+        gen = self._gen
+        self._jobs = queue.Queue()
+        threading.Thread(
+            target=self._run,
+            args=(self._factory, gen),
+            daemon=True,
+            name=f"{self._name}-{gen}",
+        ).start()
+        print(f"[{self._name}] worker gen={gen} started")
+
+    def _run(self, factory, gen: int) -> None:
         try:
             session = factory()
         except Exception as exc:  # pragma: no cover
             print(f"[{self._name}] session init failed: {exc}")
             session = None
-        while True:
-            job = self._jobs.get()
+        while gen == self._gen:
+            try:
+                job = self._jobs.get(timeout=1.0)
+            except queue.Empty:
+                continue
             if job is None:
                 return
             fn, args, kwargs, box = job
+            if box.get("abandoned"):
+                continue
             try:
+                if session is None:
+                    session = factory()
                 box["result"] = fn(session, *args, **kwargs)
             except Exception as exc:
                 box["error"] = exc
+                try:
+                    session = factory()
+                except Exception:
+                    session = None
             finally:
                 box["done"].set()
+        print(f"[{self._name}] worker gen={gen} exit (superseded)")
 
     def call(self, fn, *args, timeout: float = 120, **kwargs):
-        box = {"done": threading.Event(), "result": None, "error": None}
-        self._jobs.put((fn, args, kwargs, box))
+        box = {
+            "done": threading.Event(),
+            "result": None,
+            "error": None,
+            "abandoned": False,
+        }
+        with self._ctrl:
+            self._jobs.put((fn, args, kwargs, box))
         if not box["done"].wait(timeout):
+            box["abandoned"] = True
+            print(f"[{self._name}] TIMEOUT {timeout:.0f}s — restart worker")
+            with self._ctrl:
+                self._start_worker()
             raise TimeoutError(f"[{self._name}] job timeout ({timeout:.0f}s)")
         if box["error"] is not None:
             raise box["error"]
@@ -534,7 +568,7 @@ _session = _PlaywrightThread(PrimaBrowserSession, 'Prima IT')
 
 def warmup_session() -> None:
     try:
-        _session.call(lambda s: s._ensure_session(force_refresh=True), timeout=90)
+        _session.call(lambda s: s._ensure_session(force_refresh=True), timeout=45)
     except Exception as exc:
         print(f"[Prima IT] Warmup error: {exc}")
 
@@ -542,5 +576,5 @@ def warmup_session() -> None:
 def search_by_plate(plate: str, birth_date: str = "") -> Optional[dict]:
     return _session.call(
         lambda s: s.lookup(plate, birth_date),
-        timeout=LOOKUP_DEADLINE_SECONDS + 40,
+        timeout=JOB_TIMEOUT_SECONDS,
     )
