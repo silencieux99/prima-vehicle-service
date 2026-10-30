@@ -486,44 +486,32 @@ class PrimaBrowserSession:
 
 
 class _PlaywrightThread:
-    """Thread dedie par session Playwright.
-
-    Playwright sync ne tolere qu'un seul client par thread/boucle evenementielle.
-    Sur timeout: on abandonne le job et on REDEMARRE le thread — sinon la file
-    reste bloquee derriere un Chromium fige et /health meurt.
-    """
+    """Un seul thread Playwright — pas de restart à chaud (évite Sync/asyncio)."""
 
     def __init__(self, factory, name: str) -> None:
         self._factory = factory
         self._name = name
-        self._gen = 0
         self._jobs: "queue.Queue" = queue.Queue()
-        self._ctrl = threading.Lock()
-        self._start_worker()
+        self._thread = threading.Thread(target=self._run, daemon=True, name=name)
+        self._thread.start()
+        print(f"[{self._name}] worker started")
 
-    def _start_worker(self) -> None:
-        self._gen += 1
-        gen = self._gen
-        self._jobs = queue.Queue()
-        threading.Thread(
-            target=self._run,
-            args=(self._factory, gen),
-            daemon=True,
-            name=f"{self._name}-{gen}",
-        ).start()
-        print(f"[{self._name}] worker gen={gen} started")
-
-    def _run(self, factory, gen: int) -> None:
+    def _run(self) -> None:
         try:
-            session = factory()
+            import asyncio
+
+            asyncio.set_event_loop(asyncio.new_event_loop())
+        except Exception:
+            pass
+
+        session = None
+        try:
+            session = self._factory()
         except Exception as exc:  # pragma: no cover
             print(f"[{self._name}] session init failed: {exc}")
-            session = None
-        while gen == self._gen:
-            try:
-                job = self._jobs.get(timeout=1.0)
-            except queue.Empty:
-                continue
+
+        while True:
+            job = self._jobs.get()
             if job is None:
                 return
             fn, args, kwargs, box = job
@@ -531,17 +519,25 @@ class _PlaywrightThread:
                 continue
             try:
                 if session is None:
-                    session = factory()
+                    session = self._factory()
                 box["result"] = fn(session, *args, **kwargs)
             except Exception as exc:
                 box["error"] = exc
-                try:
-                    session = factory()
-                except Exception:
-                    session = None
+                msg = str(exc)
+                if "asyncio" in msg.lower() or "Sync API" in msg:
+                    print(f"[{self._name}] reset session after: {msg[:120]}")
+                    try:
+                        if session is not None and hasattr(session, "_close"):
+                            session._close()
+                    except Exception:
+                        pass
+                    try:
+                        session = self._factory()
+                    except Exception as exc2:
+                        print(f"[{self._name}] session recreate failed: {exc2}")
+                        session = None
             finally:
                 box["done"].set()
-        print(f"[{self._name}] worker gen={gen} exit (superseded)")
 
     def call(self, fn, *args, timeout: float = 120, **kwargs):
         box = {
@@ -550,13 +546,10 @@ class _PlaywrightThread:
             "error": None,
             "abandoned": False,
         }
-        with self._ctrl:
-            self._jobs.put((fn, args, kwargs, box))
+        self._jobs.put((fn, args, kwargs, box))
         if not box["done"].wait(timeout):
             box["abandoned"] = True
-            print(f"[{self._name}] TIMEOUT {timeout:.0f}s — restart worker")
-            with self._ctrl:
-                self._start_worker()
+            print(f"[{self._name}] TIMEOUT {timeout:.0f}s — abandon")
             raise TimeoutError(f"[{self._name}] job timeout ({timeout:.0f}s)")
         if box["error"] is not None:
             raise box["error"]

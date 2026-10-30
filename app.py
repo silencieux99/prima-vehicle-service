@@ -43,32 +43,26 @@ ALLIANZ_CACHE_TTL = int(os.environ.get("LOOKUP_CACHE_TTL_SECONDS", "3600"))
 
 _WARMED = {"prima": False, "allianz": False}
 _WARM_LOCK = threading.Lock()
+_WARM_STARTED = {"prima": False, "allianz": False}
 
 
 def _normalize_plate(plate: str) -> str:
     return plate.upper().replace(" ", "").replace("-", "")
 
 
-def ensure_warm(which: str, background: bool = False) -> None:
-    """Warm Playwright. En background pour ne jamais bloquer /health."""
-
-    def _do() -> None:
-        with _WARM_LOCK:
-            if _WARMED.get(which):
-                return
-            label = "Prima" if which == "prima" else "Allianz"
-            try:
-                print(f"[Service] Warming {label}...")
-                (prima_warmup if which == "prima" else allianz_warmup)()
-                _WARMED[which] = True
-                print(f"[Service] {label} warm OK")
-            except Exception as exc:
-                print(f"[Service] {label} warm failed: {exc}")
-
-    if background:
-        threading.Thread(target=_do, daemon=True, name=f"warm-{which}").start()
-        return
-    _do()
+def ensure_warm(which: str) -> None:
+    """Warm synchrone, une seule fois — jamais de Thread() (épuisait le process)."""
+    with _WARM_LOCK:
+        if _WARMED.get(which):
+            return
+        label = "Prima" if which == "prima" else "Allianz"
+        try:
+            print(f"[Service] Warming {label}...")
+            (prima_warmup if which == "prima" else allianz_warmup)()
+            _WARMED[which] = True
+            print(f"[Service] {label} warm OK")
+        except Exception as exc:
+            print(f"[Service] {label} warm failed: {exc}")
 
 
 def lookup_prima(plate: str, birth_date: str):
@@ -88,15 +82,14 @@ def lookup_prima(plate: str, birth_date: str):
 
 @app.route("/health", methods=["GET"])
 def health():
-    # Jamais de Playwright ici — sinon gunicorn se sature et la sonde Railway tombe.
-    ensure_warm("prima", background=True)
+    # Aucun thread, aucun Playwright — sinon "can't start new thread" / 500.
     return (
         jsonify(
             {
                 "status": "ok",
                 "service": "prima-vehicle-api",
                 "sources": ["prima-playwright"],
-                "version": "prima-resilient-2026-10-29",
+                "version": "prima-stable-2026-10-30",
                 "warmed": dict(_WARMED),
             }
         ),
